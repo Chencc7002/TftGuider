@@ -1,0 +1,9 @@
+﻿{
+  "name": "tftguider",
+  "private": true,
+  "version": "0.1.0",
+  "description": "TFT recent matches analysis prototype",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

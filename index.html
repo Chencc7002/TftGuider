@@ -1,0 +1,213 @@
+﻿<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TFTGuider - 对局分析助手</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">TFT Match Intelligence</p>
+        <h1>TFT 对局分析助手</h1>
+        <p class="subhead">围绕近 30 场对局，给出趋势、羁绊骨架偏好与可执行复盘建议。</p>
+      </div>
+      <div class="auth-panel">
+        <div class="auth-chip auth-connected" id="authStatus">Riot API 已就绪</div>
+        <button class="primary-button" type="button" id="refreshButton">重新分析</button>
+      </div>
+    </header>
+
+    <section class="query-panel panel glass">
+      <div class="query-row">
+        <label>
+          <span>服务器</span>
+          <select id="regionSelect">
+            <option value="KR" selected>韩服 KR</option>
+            <option value="JP1">日服 JP1</option>
+            <option value="NA1">美服 NA1</option>
+            <option value="EUW1">欧服 EUW1</option>
+          </select>
+        </label>
+        <label>
+          <span>游戏昵称</span>
+          <input id="gameNameInput" type="text" value="chencc" />
+        </label>
+        <label>
+          <span>Tag</span>
+          <input id="tagLineInput" type="text" value="1215" />
+        </label>
+        <button class="primary-button" type="button" id="analyzeButton">分析近 30 场</button>
+      </div>
+      <div class="query-hint" id="queryHint">将优先读取 Riot API 的真实对局数据；若接口失败，则回退到本地演示数据。</div>
+    </section>
+
+    <main class="dashboard">
+      <section class="hero-grid">
+        <aside class="profile-card panel glass" id="profileCard"></aside>
+        <div class="hero-main">
+          <section class="summary-strip" id="summaryStrip"></section>
+          <section class="panel glass trends-panel">
+            <div class="section-heading">
+              <div>
+                <p class="kicker">趋势分析</p>
+                <h2>最近 30 场表现走势</h2>
+              </div>
+              <div class="legend-inline">
+                <span><i class="dot dot-gold"></i> 名次</span>
+                <span><i class="dot dot-cyan"></i> LP / 指标</span>
+              </div>
+            </div>
+            <div class="charts-grid">
+              <article class="chart-card">
+                <div class="card-header">
+                  <h3>名次趋势</h3>
+                  <span id="placementTrendLabel"></span>
+                </div>
+                <div id="placementChart" class="chart-shell"></div>
+              </article>
+              <article class="chart-card">
+                <div class="card-header">
+                  <h3>LP 变化 / 降级指标</h3>
+                  <span id="lpTrendLabel"></span>
+                </div>
+                <div id="lpChart" class="chart-shell"></div>
+              </article>
+              <article class="chart-card chart-card-wide">
+                <div class="card-header">
+                  <h3>名次分布</h3>
+                  <span>1 - 8 名</span>
+                </div>
+                <div id="distributionChart" class="distribution-chart"></div>
+              </article>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="analysis-grid">
+        <section class="panel glass">
+          <div class="section-heading">
+            <div>
+              <p class="kicker">阵容与英雄</p>
+              <h2>常用羁绊骨架与高频核心</h2>
+            </div>
+          </div>
+          <div class="comps-layout">
+            <div id="compCards" class="comp-cards"></div>
+            <div>
+              <div class="mini-panel">
+                <div class="mini-title-row">
+                  <h3>核心英雄使用频次</h3>
+                  <span>Top 10</span>
+                </div>
+                <div id="unitBars" class="unit-bars"></div>
+              </div>
+              <div class="mini-panel heatmap-panel">
+                <div class="mini-title-row">
+                  <h3>英雄协同热力图</h3>
+                  <span>Top 8 高频单位</span>
+                </div>
+                <div id="synergyHeatmap"></div>
+              </div>
+            </div>
+          </div>
+          <div class="comp-insights-grid">
+            <article class="mini-panel comp-table-panel">
+              <div class="mini-title-row">
+                <h3>阵容数据</h3>
+                <span>近 30 场聚合</span>
+              </div>
+              <div id="compTable" class="comp-table-wrap"></div>
+            </article>
+            <article class="mini-panel comp-donut-panel">
+              <div class="mini-title-row">
+                <h3>阵容使用率分布</h3>
+                <span>按场次占比</span>
+              </div>
+              <div id="compDonut" class="chart-shell compact-chart"></div>
+            </article>
+            <article class="mini-panel comp-bubble-panel">
+              <div class="mini-title-row">
+                <h3>阵容分布图</h3>
+                <span>均名 / 前四率 / 场次</span>
+              </div>
+              <div id="compBubble" class="chart-shell bubble-chart-shell"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="panel glass">
+          <div class="section-heading">
+            <div>
+              <p class="kicker">风格诊断</p>
+              <h2>你的节奏与复盘建议</h2>
+            </div>
+            <div class="confidence-badge" id="confidenceBadge">含推断项</div>
+          </div>
+          <div class="style-columns">
+            <div>
+              <div id="styleTags" class="style-tags"></div>
+              <div id="styleMetrics" class="style-metrics"></div>
+            </div>
+            <div>
+              <div class="mini-panel">
+                <div class="mini-title-row">
+                  <h3>环境对照</h3>
+                  <span id="metaAlignmentLabel"></span>
+                </div>
+                <div id="metaPanel" class="meta-panel"></div>
+              </div>
+              <div class="mini-panel">
+                <div class="mini-title-row">
+                  <h3>复盘建议</h3>
+                  <span>可执行动作</span>
+                </div>
+                <ul id="recommendations" class="recommendation-list"></ul>
+              </div>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section class="panel glass matches-panel">
+        <div class="section-heading">
+          <div>
+            <p class="kicker">最近对局</p>
+            <h2>逐局展开复盘</h2>
+          </div>
+          <div class="legend-inline muted" id="matchesMeta">显示近 30 场</div>
+        </div>
+        <div id="matchList" class="match-list"></div>
+      </section>
+    </main>
+  </div>
+
+  <div class="replay-modal" id="replayModal" hidden>
+    <div class="replay-backdrop" id="replayBackdrop"></div>
+    <section class="replay-dialog glass" role="dialog" aria-modal="true" aria-labelledby="replayTitle">
+      <div class="replay-dialog-head">
+        <div>
+          <div class="kicker-row">
+            <p class="kicker">对局录像</p>
+            <span class="todo-pill">TODO</span>
+          </div>
+          <h2 id="replayTitle">对局录像待接入</h2>
+        </div>
+        <button class="replay-close" type="button" id="replayCloseButton" aria-label="关闭录像面板">×</button>
+      </div>
+      <div class="replay-dialog-body">
+        <div id="replayMeta" class="replay-meta-grid"></div>
+        <div id="replayContent" class="replay-content"></div>
+      </div>
+    </section>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
+
+
+

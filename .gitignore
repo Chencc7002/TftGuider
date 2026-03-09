@@ -1,0 +1,4 @@
+.env.local
+.codex/
+node_modules/
+npm-debug.log*
