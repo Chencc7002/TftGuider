@@ -49,6 +49,15 @@
         <aside class="profile-card panel glass" id="profileCard"></aside>
         <div class="hero-main">
           <section class="summary-strip" id="summaryStrip"></section>
+          <section class="panel glass snapshot-panel">
+            <div class="section-heading">
+              <div>
+                <p class="kicker">30 场总结</p>
+                <h2>近期最擅长的阵容</h2>
+              </div>
+            </div>
+            <div id="thirtyGameSummary" class="snapshot-grid"></div>
+          </section>
           <section class="panel glass trends-panel">
             <div class="section-heading">
               <div>
@@ -132,7 +141,7 @@
             <article class="mini-panel comp-bubble-panel">
               <div class="mini-title-row">
                 <h3>阵容分布图</h3>
-                <span>均名 / 前四率 / 场次</span>
+                <span>近 10 场 · 均名 / 前四率 / 场次</span>
               </div>
               <div id="compBubble" class="chart-shell bubble-chart-shell"></div>
             </article>
@@ -191,12 +200,12 @@
       <div class="replay-dialog-head">
         <div>
           <div class="kicker-row">
-            <p class="kicker">对局录像</p>
-            <span class="todo-pill">TODO</span>
+            <p class="kicker">完整对局面板</p>
+            <span class="todo-pill">历史快照</span>
           </div>
-          <h2 id="replayTitle">对局录像待接入</h2>
+          <h2 id="replayTitle">对局详情</h2>
         </div>
-        <button class="replay-close" type="button" id="replayCloseButton" aria-label="关闭录像面板">×</button>
+        <button class="replay-close" type="button" id="replayCloseButton" aria-label="关闭对局面板">×</button>
       </div>
       <div class="replay-dialog-body">
         <div id="replayMeta" class="replay-meta-grid"></div>

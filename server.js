@@ -92,6 +92,10 @@ function unique(values) {
   return [...new Set((values || []).filter(Boolean))];
 }
 
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
 function stripTags(value) {
   return decodeHtml(String(value || "").replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim());
 }
@@ -99,6 +103,7 @@ function stripTags(value) {
 function normalizeTrait(trait) {
   return {
     name: titleize(trait.name),
+    apiName: trait.name || null,
     tierCurrent: trait.tier_current,
     tierTotal: trait.tier_total,
     numUnits: trait.num_units,
@@ -109,8 +114,10 @@ function normalizeTrait(trait) {
 function normalizeUnit(unit) {
   return {
     name: titleize(unit.character_id),
+    apiName: unit.character_id || null,
     tier: unit.tier,
     rarity: unit.rarity,
+    itemIds: Array.isArray(unit.itemNames) ? unit.itemNames.slice() : [],
     items: Array.isArray(unit.itemNames) ? unit.itemNames.map(titleize) : [],
   };
 }
@@ -168,6 +175,30 @@ async function fetchText(url, headers = {}, attempt = 0) {
   return response.text();
 }
 
+async function fetchJson(url, headers = {}, attempt = 0) {
+  const response = await fetch(url, {
+    headers: {
+      "User-Agent": "TFTGuider/0.1 (+https://local-app)",
+      ...headers,
+    },
+  });
+
+  if (!response.ok) {
+    if ((response.status === 429 || response.status >= 500) && attempt < 2) {
+      const retryAfter = Number(response.headers.get("Retry-After") || 1);
+      await sleep(Math.max(retryAfter, 1) * 1000);
+      return fetchJson(url, headers, attempt + 1);
+    }
+
+    const detail = await response.text();
+    const error = new Error(detail || `HTTP ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+
+  return response.json();
+}
+
 async function riotRequest(hostType, regionKey, pathname, attempt = 0) {
   if (!RIOT_API_KEY) {
     const error = new Error("Missing RIOT_API_KEY");
@@ -215,86 +246,102 @@ async function mapWithConcurrency(items, concurrency, mapper) {
   return results;
 }
 
-async function fetchCurrentMetaSet() {
-  const homepage = await fetchText("https://metabot.gg/en/TFT");
-  const match = homepage.match(/href="\/en\/TFT\/(\d+)\/comps\/8\/pickRate"/i);
-  return match?.[1] || "16";
+function splitMetaNames(value, { removeTraitTier = false } = {}) {
+  return unique(
+    String(value || "")
+      .split(",")
+      .map((item) => titleize(item.trim()))
+      .map((item) => removeTraitTier ? item.replace(/\s+\d+$/, "").trim() : item)
+      .filter(Boolean)
+  );
 }
 
-function extractCellNumber(cellHtml) {
-  const valueMatch = String(cellHtml || "").match(/class="[^"]*value[^"]*"[^>]*>\s*([0-9]+(?:\.[0-9]+)?)%?\s*<\/div>/i);
-  if (valueMatch) {
-    return Number(valueMatch[1]);
-  }
+function inferMetaCompName(detail) {
+  const scoredNames = Array.isArray(detail?.name)
+    ? detail.name
+        .slice()
+        .sort((left, right) => (right.score || 0) - (left.score || 0))
+        .map((entry) => titleize(entry.name))
+        .filter(Boolean)
+    : [];
+  const traitNames = splitMetaNames(detail?.traits_string, { removeTraitTier: true });
+  const unitNames = splitMetaNames(detail?.units_string);
 
-  const fallbackMatch = String(cellHtml || "").match(/>\s*([0-9]+(?:\.[0-9]+)?)%?\s*<\/(?:div|span)>/i);
-  return fallbackMatch ? Number(fallbackMatch[1]) : null;
+  return unique(scoredNames).slice(0, 2).join(" / ")
+    || traitNames.slice(0, 2).join(" / ")
+    || unitNames.slice(0, 2).join(" + ")
+    || "Meta Comp";
 }
 
-function parseMetaBotComps(html, setNumber) {
-  const rowMatches = [...html.matchAll(/<tr class="index-module__F48gGq__clickableRow">([\s\S]*?)<\/tr>/g)];
-  const rows = rowMatches.map((match) => match[0]);
-  const comps = rows.map((rowHtml) => {
-    const compUrlMatch = rowHtml.match(/href="(\/en\/TFT\/comp\/[^"]+\/overview)"/i);
-    if (!compUrlMatch) {
-      return null;
-    }
+function computeMetaStrengthScore({ avgPlacement, top4Rate, firstPlaceRate, count }) {
+  const sampleConfidence = Math.min(count / 25000, 1) * 5;
+  return clamp(
+    Math.round(top4Rate * 70 + firstPlaceRate * 120 + ((8 - avgPlacement) / 7) * 25 + sampleConfidence),
+    1,
+    100
+  );
+}
 
-    const cells = [...rowHtml.matchAll(/<td\b[\s\S]*?<\/td>/g)].map((match) => match[0]);
-    if (cells.length < 8) {
-      return null;
-    }
+function buildMetaTftBenchmark(statsPayload, compsPayload, patchPayload) {
+  const statsResults = Array.isArray(statsPayload?.results) ? statsPayload.results : [];
+  const clusterDetails = compsPayload?.results?.data?.cluster_details || {};
+  const totalAnalyzed = Number(
+    statsResults.find((entry) => !entry.cluster)?.places?.[0]
+    || statsResults[0]?.places?.[0]
+    || 0
+  );
+  const setMatch = String(compsPayload?.results?.data?.tft_set || "").match(/(\d+)/);
+  const setLabel = setMatch ? `Set ${setMatch[1]} · Patch ${patchPayload?.patch || "current"}` : `Patch ${patchPayload?.patch || "current"}`;
 
-    const primaryCell = cells[0];
-    const unitsCell = cells[1];
-    const traitsCell = cells[3];
-    const avgCell = cells[4];
-    const winCell = cells[5];
-    const firstCell = cells[6];
-    const pickCell = cells[7];
+  const comps = statsResults
+    .filter((entry) => entry?.cluster && Array.isArray(entry.places) && entry.places.length >= 8 && clusterDetails[entry.cluster])
+    .map((entry) => {
+      const detail = clusterDetails[entry.cluster];
+      const placeCounts = entry.places.slice(0, 8).map((value) => Number(value) || 0);
+      const count = Number(entry.count) || placeCounts.reduce((sum, value) => sum + value, 0);
+      if (!count) {
+        return null;
+      }
 
-    const primaryTraits = unique(
-      [...primaryCell.matchAll(/<img[^>]+alt="([^"]+)"/g)].map((match) => stripTags(match[1]))
-    );
-    const traits = unique(
-      [...traitsCell.matchAll(/<img[^>]+alt="([^"]+)"/g)].map((match) => stripTags(match[1]))
-    ).slice(0, 5);
-    const units = unique(
-      [...unitsCell.matchAll(/<img[^>]+alt="([^"]+)"/g)]
-        .map((match) => stripTags(match[1]))
-        .filter((name) => name && !/build$/i.test(name))
-    ).slice(0, 8);
+      const firstPlaceRate = (placeCounts[0] || 0) / count;
+      const top4Rate = placeCounts.slice(0, 4).reduce((sum, value) => sum + value, 0) / count;
+      const avgPlacement = placeCounts.reduce((sum, value, index) => sum + value * (index + 1), 0) / count;
+      const pickRate = totalAnalyzed ? (count / totalAnalyzed) * 100 : null;
+      const strengthScore = computeMetaStrengthScore({ avgPlacement, top4Rate, firstPlaceRate, count });
 
-    const namingTraits = traits.length ? traits : primaryTraits;
-    const avgPlacement = extractCellNumber(avgCell);
-    const winRate = extractCellNumber(winCell);
-    const firstPlaceRate = extractCellNumber(firstCell);
-    const pickRate = extractCellNumber(pickCell);
-    const name = namingTraits.slice(0, 2).join("/") || units.slice(0, 2).join(" + ") || "Meta Comp";
+      return {
+        name: inferMetaCompName(detail),
+        traits: splitMetaNames(detail?.traits_string, { removeTraitTier: true }).slice(0, 5),
+        units: splitMetaNames(detail?.units_string).slice(0, 8),
+        avgPlacement: Number(avgPlacement.toFixed(2)),
+        top4Rate: Number((top4Rate * 100).toFixed(1)),
+        winRate: Number((firstPlaceRate * 100).toFixed(1)),
+        firstPlaceRate: Number((firstPlaceRate * 100).toFixed(1)),
+        pickRate: pickRate == null ? null : Number(pickRate.toFixed(2)),
+        strengthScore,
+        sampleSize: count,
+        url: "https://www.metatft.com/comps",
+      };
+    })
+    .filter((comp) => comp && comp.sampleSize >= 2500)
+    .sort((left, right) =>
+      right.strengthScore - left.strengthScore
+      || right.top4Rate - left.top4Rate
+      || right.firstPlaceRate - left.firstPlaceRate
+      || right.sampleSize - left.sampleSize
+      || left.avgPlacement - right.avgPlacement
+    )
+    .slice(0, 12);
 
-    return {
-      name,
-      traits,
-      units,
-      avgPlacement,
-      winRate,
-      firstPlaceRate,
-      pickRate,
-      url: `https://metabot.gg${compUrlMatch[1]}`,
-    };
-  }).filter(Boolean);
-
-  const lastUpdatedMatch = html.match(/Last Updated:[\s\S]*?<time[^>]*>([^<]+)<\/time>/i);
   return {
     source: {
-      name: "MetaBot.GG",
-      url: `https://metabot.gg/en/TFT/${setNumber}/comps/8/pickRate`,
-      methodologyUrl: "https://metabot.gg/en/data-methodology",
-      set: `Set ${setNumber}`,
-      updatedAt: lastUpdatedMatch ? stripTags(lastUpdatedMatch[1]) : null,
-      queueScope: "8-champion comps · All ranks",
+      name: "MetaTFT",
+      url: "https://www.metatft.com/comps",
+      set: setLabel,
+      updatedAt: null,
+      queueScope: `Ranked · Platinum+ to Challenger · 最近 3 天 · ${totalAnalyzed.toLocaleString("en-US")} 局样本`,
     },
-    comps: comps.slice(0, 12),
+    comps,
   };
 }
 
@@ -304,9 +351,12 @@ async function getMetaBenchmark() {
   }
 
   try {
-    const setNumber = await fetchCurrentMetaSet();
-    const html = await fetchText(`https://metabot.gg/en/TFT/${setNumber}/comps/8/pickRate`);
-    const benchmark = parseMetaBotComps(html, setNumber);
+    const [patchPayload, statsPayload, compsPayload] = await Promise.all([
+      fetchJson("https://api-hc.metatft.com/tft-stat-api/patch"),
+      fetchJson("https://api-hc.metatft.com/tft-comps-api/comps_stats?queue=1100&patch=current&days=3&rank=CHALLENGER,DIAMOND,EMERALD,GRANDMASTER,MASTER,PLATINUM&permit_filter_adjustment=true"),
+      fetchJson("https://api-hc.metatft.com/tft-comps-api/comps_data?queue=1100"),
+    ]);
+    const benchmark = buildMetaTftBenchmark(statsPayload, compsPayload, patchPayload);
     if (benchmark?.comps?.length) {
       metaBenchmarkCache.value = benchmark;
       metaBenchmarkCache.fetchedAt = Date.now();

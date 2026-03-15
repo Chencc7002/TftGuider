@@ -94,8 +94,10 @@ function createDemoBundle() {
       })),
       units: template.units.map((name, unitIndex) => ({
         name,
+        apiName: `TFT16_${name.replace(/\s+/g, "")}`,
         tier: unitIndex < 2 && placement <= 4 ? 2 : 1,
         rarity: unitIndex < 2 ? 4 : 2,
+        itemIds: unitIndex < 3 ? ["TFT_Item_InfinityEdge", "TFT_Item_Guardbreaker", "TFT_Item_LastWhisper"].slice(0, 1 + ((index + unitIndex) % 3)) : [],
         items: unitIndex < 3 ? ["Infinity Edge", "Guardbreaker", "Last Whisper"].slice(0, 1 + ((index + unitIndex) % 3)) : [],
       })),
       goldTrend: null,
@@ -135,6 +137,7 @@ const dom = {
   refreshButton: document.getElementById("refreshButton"),
   profileCard: document.getElementById("profileCard"),
   summaryStrip: document.getElementById("summaryStrip"),
+  thirtyGameSummary: document.getElementById("thirtyGameSummary"),
   placementTrendLabel: document.getElementById("placementTrendLabel"),
   lpTrendLabel: document.getElementById("lpTrendLabel"),
   placementChart: document.getElementById("placementChart"),
@@ -166,6 +169,8 @@ const state = {
   source: "demo",
   bundle: createDemoBundle(),
   replayMatch: null,
+  tftAssets: null,
+  tftAssetsPromise: null,
 };
 
 function escapeHtml(value) {
@@ -197,8 +202,25 @@ function formatPercent(value) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
+function formatSignedNumber(value, digits = 1) {
+  if (!Number.isFinite(value)) return "--";
+  return `${value > 0 ? "+" : ""}${value.toFixed(digits)}`;
+}
+
+function formatSignedPercentPoint(value) {
+  return `${formatSignedNumber(value, 1)}%`;
+}
+
 function formatPlacement(value) {
   return `${value.toFixed(2)} 平均名次`;
+}
+
+function getProfileIconUrl(profileIconId) {
+  const safeId = Number(profileIconId);
+  if (!Number.isFinite(safeId) || safeId <= 0) {
+    return null;
+  }
+  return `https://raw.communitydragon.org/latest/plugins/rcp-be-lol-game-data/global/default/v1/profile-icons/${safeId}.jpg`;
 }
 
 function formatDate(isoString) {
@@ -206,8 +228,333 @@ function formatDate(isoString) {
   return `${date.getMonth() + 1}/${date.getDate()} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
-function openReplayTodo(match) {
-  state.replayMatch = match;
+function normalizeLookupKey(value) {
+  return String(value || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function getSetNumberFromAssetId(id) {
+  const match = String(id || "").match(/^TFT(\d+)_/i);
+  return match ? Number(match[1]) : -1;
+}
+
+function isTutorialAssetId(id) {
+  return /^TFTTutorial_/i.test(String(id || ""));
+}
+
+function compareAssetPriority(left, right, currentSet) {
+  const leftIsCurrent = left.setNumber === currentSet;
+  const rightIsCurrent = right.setNumber === currentSet;
+  if (leftIsCurrent !== rightIsCurrent) {
+    return leftIsCurrent ? 1 : -1;
+  }
+  if (left.isTutorial !== right.isTutorial) {
+    return left.isTutorial ? -1 : 1;
+  }
+  if (left.setNumber !== right.setNumber) {
+    return left.setNumber > right.setNumber ? 1 : -1;
+  }
+  return 0;
+}
+
+function buildAssetMaps(payload, version, type) {
+  const currentSet = Number(String(version).split(".")[0]) || 0;
+  const exactMap = {};
+  const nameMap = {};
+  const imageFolder = {
+    champion: "tft-champion",
+    item: "tft-item",
+    trait: "tft-trait",
+  }[type];
+
+  Object.values(payload?.data || {}).forEach((entry) => {
+    const imageFull = entry?.image?.full;
+    const asset = {
+      id: entry?.id || null,
+      name: String(entry?.name || "").trim() || null,
+      imageUrl: imageFull ? `https://ddragon.leagueoflegends.com/cdn/${version}/img/${imageFolder}/${imageFull}` : null,
+      setNumber: getSetNumberFromAssetId(entry?.id),
+      isTutorial: isTutorialAssetId(entry?.id),
+    };
+
+    const exactKey = normalizeLookupKey(asset.id);
+    if (exactKey) {
+      exactMap[exactKey] = asset;
+    }
+
+    const nameKey = normalizeLookupKey(asset.name);
+    if (nameKey) {
+      const existing = nameMap[nameKey];
+      if (!existing || compareAssetPriority(asset, existing, currentSet) > 0) {
+        nameMap[nameKey] = asset;
+      }
+    }
+  });
+
+  return { exactMap, nameMap };
+}
+
+async function ensureTftAssetsLoaded() {
+  if (state.tftAssets) {
+    return state.tftAssets;
+  }
+  if (state.tftAssetsPromise) {
+    return state.tftAssetsPromise;
+  }
+
+  state.tftAssetsPromise = (async () => {
+    const versionsResponse = await fetch("https://ddragon.leagueoflegends.com/api/versions.json");
+    if (!versionsResponse.ok) {
+      throw new Error("无法读取 Data Dragon 版本信息");
+    }
+
+    const versions = await versionsResponse.json();
+    const version = Array.isArray(versions) && versions.length ? versions[0] : null;
+    if (!version) {
+      throw new Error("未找到可用的 Data Dragon 版本");
+    }
+
+    const [championsResponse, itemsResponse, traitsResponse] = await Promise.all([
+      fetch(`https://ddragon.leagueoflegends.com/cdn/${version}/data/en_US/tft-champion.json`),
+      fetch(`https://ddragon.leagueoflegends.com/cdn/${version}/data/en_US/tft-item.json`),
+      fetch(`https://ddragon.leagueoflegends.com/cdn/${version}/data/en_US/tft-trait.json`),
+    ]);
+
+    if (!championsResponse.ok || !itemsResponse.ok || !traitsResponse.ok) {
+      throw new Error("无法读取 TFT 静态资源");
+    }
+
+    const [championsPayload, itemsPayload, traitsPayload] = await Promise.all([
+      championsResponse.json(),
+      itemsResponse.json(),
+      traitsResponse.json(),
+    ]);
+
+    state.tftAssets = {
+      version,
+      currentSet: Number(String(version).split(".")[0]) || 0,
+      champions: buildAssetMaps(championsPayload, version, "champion"),
+      items: buildAssetMaps(itemsPayload, version, "item"),
+      traits: buildAssetMaps(traitsPayload, version, "trait"),
+    };
+    return state.tftAssets;
+  })().catch((error) => {
+    state.tftAssetsPromise = null;
+    throw error;
+  });
+
+  return state.tftAssetsPromise;
+}
+
+function getStaticAsset(group, exactValue, nameValue) {
+  const assetGroup = state.tftAssets?.[group];
+  if (!assetGroup?.exactMap || !assetGroup?.nameMap) {
+    return null;
+  }
+
+  const exactKey = normalizeLookupKey(exactValue);
+  if (exactKey && assetGroup.exactMap[exactKey]) {
+    return assetGroup.exactMap[exactKey];
+  }
+
+  const nameKey = normalizeLookupKey(nameValue);
+  if (nameKey && assetGroup.nameMap[nameKey]) {
+    return assetGroup.nameMap[nameKey];
+  }
+
+  return null;
+}
+
+function getChampionAsset(unit) {
+  return getStaticAsset("champions", unit?.apiName, unit?.name);
+}
+
+function getItemAsset(itemId, itemName) {
+  return getStaticAsset("items", itemId, itemName);
+}
+
+function getTraitAsset(trait) {
+  return getStaticAsset("traits", trait?.apiName, trait?.name);
+}
+
+function getUnitAvatarMarkup(unit, compact = false) {
+  const asset = getChampionAsset(unit);
+  const label = `${unit.name || "未知英雄"}头像`;
+  const fallbackText = escapeHtml(String(unit.name || "?").slice(0, 1).toUpperCase());
+  const avatarClass = compact ? "unit-avatar compact" : "unit-avatar";
+  const imageClass = compact ? "unit-avatar-image compact" : "unit-avatar-image";
+
+  if (!asset?.imageUrl) {
+    return `<div class="${avatarClass} fallback">${fallbackText}</div>`;
+  }
+
+  return `
+    <div class="${avatarClass}">
+      <span class="unit-avatar-fallback">${fallbackText}</span>
+      <img class="${imageClass}" src="${escapeHtml(asset.imageUrl)}" alt="${escapeHtml(label)}" loading="lazy" onerror="this.remove()">
+    </div>
+  `;
+}
+
+function getIconMarkup(asset, label, className, fallbackText) {
+  const safeFallback = escapeHtml(String(fallbackText || "?").slice(0, 2).toUpperCase());
+  if (!asset?.imageUrl) {
+    return `<div class="${className} fallback">${safeFallback}</div>`;
+  }
+
+  return `
+    <div class="${className}">
+      <span class="${className}-fallback">${safeFallback}</span>
+      <img class="${className}-image" src="${escapeHtml(asset.imageUrl)}" alt="${escapeHtml(label)}" loading="lazy" onerror="this.remove()">
+    </div>
+  `;
+}
+
+function renderTraitPills(match, compact = false) {
+  const traits = getActiveTraits(match);
+  if (!traits.length) {
+    return `<div class="detail-empty">暂无羁绊数据</div>`;
+  }
+
+  return `
+    <div class="trait-pill-list ${compact ? "compact" : ""}">
+      ${traits.map((trait) => `
+        <div class="trait-pill">
+          ${getIconMarkup(getTraitAsset(trait), `${trait.name || "未知羁绊"}图标`, "trait-icon", String(trait.name || "?").slice(0, 1))}
+          <div class="trait-pill-copy">
+            <strong>${escapeHtml(trait.name)}</strong>
+            <span>${escapeHtml(`${trait.numUnits} 人 · ${trait.tierCurrent}/${trait.tierTotal}`)}</span>
+          </div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderAugmentList(match) {
+  if (!(match.augments || []).length) {
+    return `<div class="detail-empty">历史接口未返回强化符文</div>`;
+  }
+
+  return `
+    <div class="augment-list">
+      ${(match.augments || []).map((augment, index) => `
+        <div class="augment-card">
+          <span>增强 ${index + 1}</span>
+          <strong>${escapeHtml(augment)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderKnownTimeline(match) {
+  const points = [
+    { label: "开始", value: formatDate(match.playedAt) },
+    { label: "终盘等级", value: `Level ${match.level || "--"}` },
+    { label: "最后回合", value: match.lastRound != null ? `Round ${match.lastRound}` : "历史接口缺失" },
+    { label: "淘汰人数", value: `${match.playersEliminated || 0} 人` },
+    { label: "伤害", value: match.totalDamageToPlayers != null ? `${match.totalDamageToPlayers}` : "缺失" },
+  ];
+
+  return `
+    <div class="known-timeline">
+      ${points.map((point) => `
+        <div class="timeline-point">
+          <span>${escapeHtml(point.label)}</span>
+          <strong>${escapeHtml(point.value)}</strong>
+        </div>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderUnitBoard(match, compact = false) {
+  const units = (match.units || []).slice().sort((left, right) => scoreUnitForSkeleton(right) - scoreUnitForSkeleton(left));
+  if (!units.length) {
+    return `<div class="detail-empty">暂无终盘单位数据</div>`;
+  }
+
+  return `
+    <div class="unit-board ${compact ? "compact" : ""}">
+      ${units.map((unit) => `
+        <article class="unit-card ${compact ? "compact" : ""}">
+          <div class="unit-card-top">
+            ${getUnitAvatarMarkup(unit, compact)}
+            <div class="unit-card-copy">
+              <strong>${escapeHtml(unit.name || "未知英雄")}</strong>
+              <span>${"★".repeat(Math.max(1, unit.tier || 1))} · ${escapeHtml(`${(unit.items || []).length} 件装备`)}</span>
+            </div>
+          </div>
+          <div class="unit-items">
+            ${(unit.items || []).length
+              ? unit.items.map((item, index) => {
+                const itemId = unit.itemIds?.[index];
+                const itemAsset = getItemAsset(itemId, item);
+                return `
+                  <span class="item-chip">
+                    ${getIconMarkup(itemAsset, `${item || "未知装备"}图标`, "item-icon", String(item || "?").slice(0, 1))}
+                    <span>${escapeHtml(item)}</span>
+                  </span>
+                `;
+              }).join("")
+              : `<span class="item-chip muted-chip">无装备</span>`}
+          </div>
+        </article>
+      `).join("")}
+    </div>
+  `;
+}
+
+function renderMatchDetailSummary(match) {
+  const cards = [
+    { label: "终盘等级", value: `${match.level || "--"}` },
+    { label: "最后回合", value: match.lastRound != null ? `${match.lastRound}` : "--" },
+    { label: "对玩家伤害", value: match.totalDamageToPlayers != null ? `${match.totalDamageToPlayers}` : "--" },
+    { label: "剩余金币", value: match.goldLeft != null ? `${match.goldLeft}` : "未知" },
+  ];
+
+  return cards.map((item) => `
+    <article class="detail-box detail-metric-card">
+      <span>${escapeHtml(item.label)}</span>
+      <strong>${escapeHtml(item.value)}</strong>
+    </article>
+  `).join("");
+}
+
+function renderExpandedMatchDetail(match) {
+  return `
+    <div class="match-detail-grid detail-metric-grid">
+      ${renderMatchDetailSummary(match)}
+    </div>
+    <div class="detail-section-grid">
+      <div class="detail-box detail-box-wide">
+        <div class="detail-section-head">
+          <h4>终盘英雄面板</h4>
+          <span>${escapeHtml(`${(match.units || []).length} 个单位`)}</span>
+        </div>
+        ${renderUnitBoard(match, true)}
+      </div>
+      <div class="detail-box">
+        <div class="detail-section-head">
+          <h4>终盘羁绊</h4>
+          <span>按激活强度排序</span>
+        </div>
+        ${renderTraitPills(match, true)}
+      </div>
+      <div class="detail-box">
+        <div class="detail-section-head">
+          <h4>增强顺序</h4>
+          <span>历史接口只保留选择结果</span>
+        </div>
+        ${renderAugmentList(match)}
+      </div>
+    </div>
+  `;
+}
+
+function renderReplayPanel(match) {
   const compName = inferBoardSummary(match);
   const lpLabel = typeof match.lpChange === "number"
     ? `${match.lpChange > 0 ? "+" : ""}${match.lpChange} LP`
@@ -217,7 +564,8 @@ function openReplayTodo(match) {
   dom.replayMeta.innerHTML = [
     { label: "对局时间", value: formatDate(match.playedAt) },
     { label: "对局 ID", value: match.matchId || "暂不可得" },
-    { label: "当前占位", value: lpLabel },
+    { label: "结果 / LP", value: lpLabel },
+    { label: "终盘等级", value: `Level ${match.level || "--"}` },
   ].map((item) => `
     <article class="replay-meta-card">
       <span>${escapeHtml(item.label)}</span>
@@ -226,19 +574,68 @@ function openReplayTodo(match) {
   `).join("");
 
   dom.replayContent.innerHTML = `
-    <div class="replay-content">
-      <h3>录像入口待接入</h3>
-      <p>这里已经预留了逐局录像查看入口，后续我们只需要把真实回放源接进来，就可以从这张卡片直接跳转或播放。</p>
-      <ul class="replay-todo-list">
-        <li>当前可用于绑定回放的关键字段：<strong>${escapeHtml(match.matchId || "暂不可得")}</strong>、服务器 <strong>${escapeHtml(dom.regionSelect.value)}</strong>、对局时间 <strong>${escapeHtml(formatDate(match.playedAt))}</strong>。</li>
-        <li>后续可商定的回放来源包括：第三方战绩站回放页、录屏文件索引，或自建回放快照服务。</li>
-        <li>正式接入前，这里先作为 TODO 面板使用，方便逐局标记哪些对局值得回看。</li>
-      </ul>
+    <div class="replay-stack">
+      <section class="replay-content">
+        <div class="detail-section-head">
+          <h3>已知节点时间线</h3>
+          <span>不是逐回合日志</span>
+        </div>
+        <p>Riot TFT 历史对局接口不会返回每一回合的商店、站位、战斗结果和经济变化，这里只展示官方确实提供的已知节点。</p>
+        ${renderKnownTimeline(match)}
+      </section>
+      <section class="replay-content">
+        <div class="detail-section-head">
+          <h3>终盘英雄面板</h3>
+          <span>${state.tftAssets ? `Data Dragon ${escapeHtml(state.tftAssets.version)}` : "头像加载中或回退字母"}</span>
+        </div>
+        ${renderUnitBoard(match)}
+      </section>
+      <div class="replay-two-column">
+        <section class="replay-content">
+          <div class="detail-section-head">
+            <h3>终盘羁绊</h3>
+            <span>${escapeHtml(`${getActiveTraits(match).length} 条激活`)}</span>
+          </div>
+          ${renderTraitPills(match)}
+        </section>
+        <section class="replay-content">
+          <div class="detail-section-head">
+            <h3>增强顺序</h3>
+            <span>保留选择结果</span>
+          </div>
+          ${renderAugmentList(match)}
+        </section>
+      </div>
+      <section class="replay-content replay-note-panel">
+        <div class="detail-section-head">
+          <h3>数据范围说明</h3>
+          <span>避免误导</span>
+        </div>
+        <ul class="replay-todo-list">
+          <li>可以稳定展示：终盘英雄、星级、装备、羁绊、增强、最后回合、最终等级、淘汰人数、对玩家伤害。</li>
+          <li>当前 Riot TFT 历史接口没有逐回合时间线，所以无法还原每回合站位、D 牌、升人口、连胜连败和具体战斗过程。</li>
+          <li>如果后续你要“真时间线”，只能接第三方记录源或自己在对局进行中采样，不是单靠赛后历史接口。</li>
+        </ul>
+      </section>
     </div>
   `;
+}
 
+function openReplayTodo(match) {
+  state.replayMatch = match;
+  renderReplayPanel(match);
   dom.replayModal.hidden = false;
   document.body.classList.add("modal-open");
+
+  ensureTftAssetsLoaded()
+    .then(() => {
+      if (state.replayMatch?.matchId === match.matchId) {
+        renderReplayPanel(match);
+      }
+    })
+    .catch(() => {
+      // Keep the fallback initials when external static assets are unavailable.
+    });
 }
 
 function closeReplayTodo() {
@@ -258,28 +655,89 @@ function getActiveTraits(match) {
     .sort((left, right) => (right.numUnits || 0) - (left.numUnits || 0) || (right.tierCurrent || 0) - (left.tierCurrent || 0));
 }
 
-function getKeyUnits(match) {
-  return (match.units || [])
-    .slice()
-    .sort((left, right) => (right.items?.length || 0) - (left.items?.length || 0) || (right.tier || 0) - (left.tier || 0) || (right.rarity || 0) - (left.rarity || 0))
-    .slice(0, 2)
-    .map((unit) => unit.name);
+function scoreUnitForSkeleton(unit) {
+  return ((unit.items?.length || 0) * 100) + ((unit.tier || 0) * 18) + ((unit.rarity || 0) * 8);
+}
+
+function uniqueValues(items) {
+  return [...new Set(items.filter(Boolean))];
+}
+
+function getKeyUnits(match, limit = 4) {
+  return uniqueValues(
+    (match.units || [])
+      .slice()
+      .sort((left, right) => scoreUnitForSkeleton(right) - scoreUnitForSkeleton(left) || (right.items?.length || 0) - (left.items?.length || 0) || (right.tier || 0) - (left.tier || 0) || (right.rarity || 0) - (left.rarity || 0))
+      .map((unit) => unit.name)
+  ).slice(0, limit);
+}
+
+function getBoardUnits(match) {
+  return uniqueValues((match.units || []).map((unit) => unit.name));
+}
+
+function hasObviousTraitSkeleton(activeTraits) {
+  const topTrait = activeTraits[0];
+  const secondTrait = activeTraits[1];
+  const largeTraitCount = activeTraits.filter((trait) => (trait.numUnits || 0) >= 4).length;
+
+  return Boolean(
+    (topTrait?.numUnits || 0) >= 5
+    || ((topTrait?.numUnits || 0) >= 4 && (secondTrait?.numUnits || 0) >= 3)
+    || largeTraitCount >= 2
+  );
+}
+
+function buildBoardIdentity(match) {
+  const activeTraits = getActiveTraits(match);
+  const keyUnits = getKeyUnits(match, 4);
+  const boardUnits = getBoardUnits(match);
+  const obviousTraitSkeleton = hasObviousTraitSkeleton(activeTraits);
+  const traitNames = activeTraits.map((trait) => trait.name);
+  const traitSummary = activeTraits.slice(0, 4).map((trait) => `${trait.name} ${trait.numUnits}`);
+
+  if (obviousTraitSkeleton) {
+    const primaryTraits = activeTraits.slice(0, 2);
+    const bucketKey = primaryTraits.map((trait) => trait.name).join(" / ") || keyUnits.slice(0, 2).join(" + ") || "未识别骨架";
+    const summaryParts = [
+      primaryTraits.map((trait) => `${trait.name} ${trait.numUnits}`).join(" / "),
+      keyUnits.slice(0, 2).join(" + "),
+    ].filter(Boolean);
+    return {
+      bucketKey,
+      summary: summaryParts.join(" · ") || "未识别对局摘要",
+      traits: traitSummary,
+      traitNames,
+      keyUnits,
+      boardUnits,
+      hasObviousTraitSkeleton: true,
+      skeletonMode: "trait",
+    };
+  }
+
+  const bucketKey = keyUnits.slice(0, 2).join(" + ") || activeTraits.slice(0, 2).map((trait) => trait.name).join(" / ") || "未识别骨架";
+  const summaryParts = [
+    keyUnits.slice(0, 3).join(" + "),
+    traitSummary.slice(0, 2).join(" / "),
+  ].filter(Boolean);
+  return {
+    bucketKey,
+    summary: summaryParts.join(" · ") || "未识别对局摘要",
+    traits: traitSummary,
+    traitNames,
+    keyUnits,
+    boardUnits,
+    hasObviousTraitSkeleton: false,
+    skeletonMode: "carry",
+  };
 }
 
 function inferBoardBucket(match) {
-  const activeTraits = getActiveTraits(match).slice(0, 2).map((trait) => trait.name);
-  if (activeTraits.length) return activeTraits.join(" / ");
-  const keyUnits = getKeyUnits(match);
-  return keyUnits.join(" + ") || "未识别骨架";
+  return buildBoardIdentity(match).bucketKey;
 }
 
 function inferBoardSummary(match) {
-  const activeTraits = getActiveTraits(match).slice(0, 2).map((trait) => `${trait.name} ${trait.numUnits}`);
-  const keyUnits = getKeyUnits(match);
-  if (activeTraits.length && keyUnits.length) {
-    return `${activeTraits.join(" / ")} · ${keyUnits.join(" + ")}`;
-  }
-  return activeTraits.join(" / ") || keyUnits.join(" + ") || "未识别对局摘要";
+  return buildBoardIdentity(match).summary;
 }
 
 function summarizeTraits(match) {
@@ -316,15 +774,351 @@ function buildDemoMetaComps() {
 function scoreCompAgainstMetaComp(comp, metaComp) {
   const playerTraits = new Set((comp.traitNames || []).map((trait) => traitNameFromSummary(trait)));
   const metaTraits = [...new Set((metaComp.traits || []).map((trait) => traitNameFromSummary(trait)))];
-  const playerUnits = new Set(comp.keyUnits || []);
+  const playerBoardUnits = [...new Set(comp.boardUnits || comp.keyUnits || [])];
+  const playerKeyUnits = comp.keyUnits || [];
   const metaUnits = [...new Set(metaComp.units || [])];
+  const metaUnitSet = new Set(metaUnits);
 
   const traitOverlap = metaTraits.filter((trait) => playerTraits.has(trait)).length;
-  const unitOverlap = metaUnits.filter((unit) => playerUnits.has(unit)).length;
   const traitBase = Math.max(Math.min(metaTraits.length, 3), 1);
-  const unitBase = Math.max(Math.min(metaUnits.length, 2), 1);
-  const rawScore = ((traitOverlap / traitBase) * 0.75) + ((unitOverlap / unitBase) * 0.25);
+  const traitScore = traitOverlap / traitBase;
+  const keyUnitWeights = [1, 0.85, 0.7, 0.55];
+  const keyUnitWeightTotal = playerKeyUnits
+    .slice(0, keyUnitWeights.length)
+    .reduce((sum, _unit, index) => sum + keyUnitWeights[index], 0);
+  const keyUnitScore = keyUnitWeightTotal
+    ? playerKeyUnits
+      .slice(0, keyUnitWeights.length)
+      .reduce((sum, unit, index) => sum + (metaUnitSet.has(unit) ? keyUnitWeights[index] : 0), 0) / keyUnitWeightTotal
+    : 0;
+  const boardUnitOverlap = playerBoardUnits.filter((unit) => metaUnitSet.has(unit)).length;
+  const boardUnitBase = Math.max(Math.min(metaUnits.length, 4), 1);
+  const boardUnitScore = boardUnitOverlap / boardUnitBase;
+  const carryLedSkeleton = comp.hasObviousTraitSkeleton === false || comp.skeletonMode === "carry";
+  const weights = carryLedSkeleton
+    ? { trait: 0.25, keyUnits: 0.45, boardUnits: 0.3, bridge: 0.1 }
+    : { trait: 0.55, keyUnits: 0.25, boardUnits: 0.2, bridge: 0.08 };
+  const hasKeyUnitBridge = playerKeyUnits.some((unit) => metaUnitSet.has(unit));
+  const hasBoardUnitBridge = boardUnitOverlap > 0;
+  const bridgeBonus = traitOverlap > 0
+    ? hasKeyUnitBridge
+      ? weights.bridge
+      : hasBoardUnitBridge
+      ? weights.bridge * 0.7
+      : 0
+    : 0;
+  const rawScore = (traitScore * weights.trait) + (keyUnitScore * weights.keyUnits) + (boardUnitScore * weights.boardUnits) + bridgeBonus;
   return clamp(Math.round(rawScore * 100), 0, 100);
+}
+
+function classifyMetaCompStandard(matchedMeta) {
+  const top4Rate = Number(matchedMeta?.top4Rate ?? 0);
+  const firstPlaceRate = Number(matchedMeta?.firstPlaceRate ?? matchedMeta?.winRate ?? 0);
+  const firstToTop4Ratio = firstPlaceRate / Math.max(top4Rate, 1);
+
+  if (top4Rate >= 57 && firstPlaceRate <= 15.5) {
+    return {
+      type: "top4",
+      label: "保分阵容",
+      shortLabel: "保分标准",
+      summary: "这类阵容更看重前四稳定性和均名，不会强求很高的登顶率。",
+      weights: {
+        avgPlacement: 22,
+        top4: 1.2,
+        first: 0.45,
+      },
+    };
+  }
+
+  if (firstPlaceRate >= 18 || (firstPlaceRate >= 15 && firstToTop4Ratio >= 0.34)) {
+    return {
+      type: "cap",
+      label: "上限阵容",
+      shortLabel: "上限标准",
+      summary: "这类阵容重点看优势局能不能转化成登顶，吃鸡率比前四率更关键。",
+      weights: {
+        avgPlacement: 14,
+        top4: 0.7,
+        first: 1.55,
+      },
+    };
+  }
+
+  if (top4Rate <= 49 && firstPlaceRate >= 13) {
+    return {
+      type: "swing",
+      label: "波动阵容",
+      shortLabel: "波动标准",
+      summary: "这类阵容本身波动较大，会同时看均名和登顶，前四只做辅助参考。",
+      weights: {
+        avgPlacement: 18,
+        top4: 0.6,
+        first: 1.25,
+      },
+    };
+  }
+
+  return {
+    type: "balanced",
+    label: "均衡阵容",
+    shortLabel: "均衡标准",
+    summary: "这类阵容前四和登顶都重要，按相对均衡的标准比较。",
+    weights: {
+      avgPlacement: 18,
+      top4: 0.95,
+      first: 1.0,
+    },
+  };
+}
+
+function buildCompMetaComparison(comp, matchedMeta) {
+  if (!matchedMeta) {
+    return null;
+  }
+
+  if (![matchedMeta.avgPlacement, matchedMeta.top4Rate, matchedMeta.firstPlaceRate ?? matchedMeta.winRate].every(Number.isFinite)) {
+    return null;
+  }
+
+  const standard = classifyMetaCompStandard(matchedMeta);
+  const playerTop4Rate = Number((comp.top4Rate * 100).toFixed(1));
+  const playerFirstRate = Number((comp.winRate * 100).toFixed(1));
+  const metaTop4Rate = Number(matchedMeta.top4Rate ?? 0);
+  const metaFirstRate = Number(matchedMeta.firstPlaceRate ?? matchedMeta.winRate ?? 0);
+  const avgPlacementGap = Number((comp.avgPlacement - (matchedMeta.avgPlacement || 0)).toFixed(2));
+  const top4Gap = Number((playerTop4Rate - metaTop4Rate).toFixed(1));
+  const firstGap = Number((playerFirstRate - metaFirstRate).toFixed(1));
+  const rawScore = 50
+    + ((matchedMeta.avgPlacement || 0) - comp.avgPlacement) * standard.weights.avgPlacement
+    + top4Gap * standard.weights.top4
+    + firstGap * standard.weights.first
+    + Math.min(comp.count, 6) * 1.5;
+  const proficiencyScore = clamp(Math.round(rawScore), 0, 100);
+
+  if (comp.count <= 1) {
+    return {
+      standardType: standard.type,
+      standardLabel: standard.label,
+      standardShortLabel: standard.shortLabel,
+      standardSummary: standard.summary,
+      playerTop4Rate,
+      playerFirstRate,
+      metaTop4Rate,
+      metaFirstRate,
+      avgPlacementGap,
+      top4Gap,
+      firstGap,
+      proficiencyScore,
+      label: "样本少",
+      tone: "muted",
+      summary: "仅 1 场命中该骨架，先不对熟练度下结论。",
+    };
+  }
+
+  if (proficiencyScore >= 62) {
+    return {
+      standardType: standard.type,
+      standardLabel: standard.label,
+      standardShortLabel: standard.shortLabel,
+      standardSummary: standard.summary,
+      playerTop4Rate,
+      playerFirstRate,
+      metaTop4Rate,
+      metaFirstRate,
+      avgPlacementGap,
+      top4Gap,
+      firstGap,
+      proficiencyScore,
+      label: "高于环境",
+      tone: "good",
+      summary: `${standard.label}标准下，该骨架的转化效率高于环境均值，说明理解和执行都比较到位。`,
+    };
+  }
+
+  if (proficiencyScore >= 48) {
+    return {
+      standardType: standard.type,
+      standardLabel: standard.label,
+      standardShortLabel: standard.shortLabel,
+      standardSummary: standard.summary,
+      playerTop4Rate,
+      playerFirstRate,
+      metaTop4Rate,
+      metaFirstRate,
+      avgPlacementGap,
+      top4Gap,
+      firstGap,
+      proficiencyScore,
+      label: "接近环境",
+      tone: "neutral",
+      summary: `${standard.label}标准下，该骨架表现基本贴近环境均值，更多是细节优化空间，而不是明显短板。`,
+    };
+  }
+
+  if (proficiencyScore >= 36) {
+    return {
+      standardType: standard.type,
+      standardLabel: standard.label,
+      standardShortLabel: standard.shortLabel,
+      standardSummary: standard.summary,
+      playerTop4Rate,
+      playerFirstRate,
+      metaTop4Rate,
+      metaFirstRate,
+      avgPlacementGap,
+      top4Gap,
+      firstGap,
+      proficiencyScore,
+      label: "略低环境",
+      tone: "warn",
+      summary: `${standard.label}标准下，该骨架略低于环境均值，通常意味着转型节点、站位或装备分配还有提升空间。`,
+    };
+  }
+
+  return {
+    standardType: standard.type,
+    standardLabel: standard.label,
+    standardShortLabel: standard.shortLabel,
+    standardSummary: standard.summary,
+    playerTop4Rate,
+    playerFirstRate,
+    metaTop4Rate,
+    metaFirstRate,
+    avgPlacementGap,
+    top4Gap,
+    firstGap,
+    proficiencyScore,
+    label: "待提升",
+    tone: "bad",
+    summary: `${standard.label}标准下，该骨架明显低于环境均值，更像是熟练度或局内决策问题，而不是阵容本身偏弱。`,
+  };
+}
+
+function pickSignatureComps(compStats) {
+  const candidates = compStats
+    .filter((comp) => comp.count >= 2)
+    .sort((left, right) =>
+      (right.metaComparison?.proficiencyScore ?? -1) - (left.metaComparison?.proficiencyScore ?? -1)
+      || right.strengthScore - left.strengthScore
+      || right.count - left.count
+      || left.avgPlacement - right.avgPlacement
+    );
+
+  if (candidates.length >= 2) {
+    return candidates.slice(0, 2);
+  }
+
+  if (candidates.length === 1) {
+    const fallback = compStats
+      .filter((comp) => comp.name !== candidates[0].name)
+      .sort((left, right) => right.strengthScore - left.strengthScore || right.count - left.count || left.avgPlacement - right.avgPlacement)[0];
+    return fallback ? [candidates[0], fallback] : candidates;
+  }
+
+  return compStats
+    .slice()
+    .sort((left, right) => right.strengthScore - left.strengthScore || right.count - left.count || left.avgPlacement - right.avgPlacement)
+    .slice(0, 2);
+}
+
+function buildCompStatsFromMatches(matches, totalMatches = matches.length) {
+  const compMap = new Map();
+  for (const match of matches) {
+    const boardIdentity = buildBoardIdentity(match);
+    const bucketKey = boardIdentity.bucketKey;
+    if (!compMap.has(bucketKey)) {
+      compMap.set(bucketKey, {
+        bucketKey,
+        name: boardIdentity.summary,
+        matches: [],
+        traits: boardIdentity.traits,
+        traitNames: boardIdentity.traitNames,
+        keyUnits: boardIdentity.keyUnits,
+        boardUnits: boardIdentity.boardUnits,
+        hasObviousTraitSkeleton: boardIdentity.hasObviousTraitSkeleton,
+        skeletonMode: boardIdentity.skeletonMode,
+      });
+    }
+    compMap.get(bucketKey).matches.push(match);
+  }
+
+  return [...compMap.values()]
+    .map((entry) => {
+      const entryPlacements = entry.matches.map((match) => match.placement);
+      const avgPlacement = average(entryPlacements);
+      const top4Rate = entry.matches.filter((match) => match.placement <= 4).length / entry.matches.length;
+      const winRate = entry.matches.filter((match) => match.placement === 1).length / entry.matches.length;
+      const eighthRate = entry.matches.filter((match) => match.placement === 8).length / entry.matches.length;
+      const playRate = entry.matches.length / Math.max(totalMatches, 1);
+      const strengthScore = clamp(
+        Math.round(((6.7 - avgPlacement) / 5.7) * 42 + top4Rate * 33 + winRate * 18 + playRate * 20),
+        18,
+        98
+      );
+      const tier = strengthScore >= 78 ? "S" : strengthScore >= 64 ? "A" : strengthScore >= 50 ? "B" : "C";
+
+      return {
+        name: entry.name,
+        bucketKey: entry.bucketKey,
+        count: entry.matches.length,
+        avgPlacement,
+        top4Rate,
+        winRate,
+        eighthRate,
+        playRate,
+        strengthScore,
+        tier,
+        tierColor: COMP_TIER_COLORS[tier],
+        traits: entry.traits,
+        traitNames: entry.traitNames,
+        keyUnits: entry.keyUnits,
+        boardUnits: entry.boardUnits,
+        hasObviousTraitSkeleton: entry.hasObviousTraitSkeleton,
+        skeletonMode: entry.skeletonMode,
+      };
+    })
+    .sort((left, right) => right.count - left.count || left.avgPlacement - right.avgPlacement);
+}
+
+function buildRecentBubbleStats(matches) {
+  const compMap = new Map();
+
+  for (const match of matches) {
+    const name = inferBoardSummary(match);
+    if (!compMap.has(name)) {
+      compMap.set(name, {
+        name,
+        matches: [],
+      });
+    }
+    compMap.get(name).matches.push(match);
+  }
+
+  return [...compMap.values()]
+    .map((entry) => {
+      const entryPlacements = entry.matches.map((match) => match.placement);
+      const avgPlacement = average(entryPlacements);
+      const top4Rate = entry.matches.filter((match) => match.placement <= 4).length / entry.matches.length;
+      const winRate = entry.matches.filter((match) => match.placement === 1).length / entry.matches.length;
+      const strengthScore = clamp(
+        Math.round(((6.7 - avgPlacement) / 5.7) * 42 + top4Rate * 33 + winRate * 18 + (entry.matches.length / Math.max(matches.length, 1)) * 20),
+        18,
+        98
+      );
+      const tier = strengthScore >= 78 ? "S" : strengthScore >= 64 ? "A" : strengthScore >= 50 ? "B" : "C";
+
+      return {
+        name: entry.name,
+        count: entry.matches.length,
+        avgPlacement,
+        top4Rate,
+        winRate,
+        strengthScore,
+        tier,
+        tierColor: COMP_TIER_COLORS[tier],
+      };
+    })
+    .sort((left, right) => right.count - left.count || left.avgPlacement - right.avgPlacement);
 }
 
 function analyzeBundle(bundle, source = "demo") {
@@ -363,55 +1157,8 @@ function analyzeBundle(bundle, source = "demo") {
     return { label: formatDate(match.playedAt), value: Math.round(cumulative) };
   });
 
-  const compMap = new Map();
-  for (const match of matches) {
-    const bucketKey = inferBoardBucket(match);
-    if (!compMap.has(bucketKey)) {
-      compMap.set(bucketKey, {
-        bucketKey,
-        name: inferBoardSummary(match),
-        matches: [],
-        traits: summarizeTraits(match),
-        traitNames: getActiveTraits(match).map((trait) => trait.name),
-        keyUnits: getKeyUnits(match),
-      });
-    }
-    compMap.get(bucketKey).matches.push(match);
-  }
-
-  const compStats = [...compMap.values()]
-    .map((entry) => {
-      const entryPlacements = entry.matches.map((match) => match.placement);
-      const avgPlacement = average(entryPlacements);
-      const top4Rate = entry.matches.filter((match) => match.placement <= 4).length / entry.matches.length;
-      const winRate = entry.matches.filter((match) => match.placement === 1).length / entry.matches.length;
-      const eighthRate = entry.matches.filter((match) => match.placement === 8).length / entry.matches.length;
-      const playRate = entry.matches.length / Math.max(matches.length, 1);
-      const strengthScore = clamp(
-        Math.round(((6.7 - avgPlacement) / 5.7) * 42 + top4Rate * 33 + winRate * 18 + playRate * 20),
-        18,
-        98
-      );
-      const tier = strengthScore >= 78 ? "S" : strengthScore >= 64 ? "A" : strengthScore >= 50 ? "B" : "C";
-
-      return {
-        name: entry.name,
-        bucketKey: entry.bucketKey,
-        count: entry.matches.length,
-        avgPlacement,
-        top4Rate,
-        winRate,
-        eighthRate,
-        playRate,
-        strengthScore,
-        tier,
-        tierColor: COMP_TIER_COLORS[tier],
-        traits: entry.traits,
-        traitNames: entry.traitNames,
-        keyUnits: entry.keyUnits,
-      };
-    })
-    .sort((left, right) => right.count - left.count || left.avgPlacement - right.avgPlacement);
+  const compStats = buildCompStatsFromMatches(matches, matches.length);
+  const recentCompStats = buildRecentBubbleStats(recent10);
 
   const unitFrequency = new Map();
   matches.forEach((match) => {
@@ -460,14 +1207,28 @@ function analyzeBundle(bundle, source = "demo") {
           }))
           .sort((left, right) => right.score - left.score || (right.metaComp.pickRate || 0) - (left.metaComp.pickRate || 0));
         const best = candidates[0] || null;
+        const minMatchScore = comp.hasObviousTraitSkeleton ? 45 : 38;
+        const matched = best?.score >= minMatchScore ? best.metaComp : null;
+        const comparison = matched ? buildCompMetaComparison(comp, matched) : null;
         return {
           comp: comp.name,
           count: comp.count,
           matchScore: best?.score || 0,
-          matched: best?.score >= 45 ? best.metaComp : null,
+          matched,
+          comparison,
         };
       })
     : [];
+
+  const metaMatchByComp = new Map(metaMatches.map((entry) => [entry.comp, entry]));
+  const compStatsWithMeta = compStats.map((comp) => {
+    const metaEntry = metaMatchByComp.get(comp.name);
+    return {
+      ...comp,
+      matchedMeta: metaEntry?.matched || null,
+      metaComparison: metaEntry?.comparison || null,
+    };
+  });
 
   const matchedWeight = metaMatches.reduce((sum, entry) => sum + (entry.count * entry.matchScore) / 100, 0);
   const metaAlignmentScore = metaAvailable ? clamp(Math.round((matchedWeight / Math.max(matches.length, 1)) * 100), 0, 100) : null;
@@ -527,9 +1288,40 @@ function analyzeBundle(bundle, source = "demo") {
     const topMetaNames = metaSourceComps.slice(0, 3).map((comp) => comp.name).join("、");
     recommendations.push(`你最近的高频骨架与 ${metaSourceLabel} 当前热门骨架重合度偏低，可重点观察 ${topMetaNames} 的成型思路和转型节点。`);
   }
+  const weakestMatchedComp = metaMatches
+    .filter((entry) => entry.comparison && entry.count >= 3)
+    .sort((left, right) => (left.comparison?.proficiencyScore || 0) - (right.comparison?.proficiencyScore || 0))[0];
+  if (weakestMatchedComp?.comparison?.proficiencyScore < 42) {
+    recommendations.push(
+      `${weakestMatchedComp.comp} 近 ${weakestMatchedComp.count} 场按${weakestMatchedComp.comparison.standardLabel}标准低于对应环境均值：均名 ${formatSignedNumber(weakestMatchedComp.comparison.avgPlacementGap, 2)}、前四 ${formatSignedPercentPoint(weakestMatchedComp.comparison.top4Gap)}、登顶 ${formatSignedPercentPoint(weakestMatchedComp.comparison.firstGap)}。这更像熟练度或转型细节问题，建议优先复盘这一套。`
+    );
+  }
   if (!hasRealLpChanges) {
     recommendations.push("当前 Riot 官方接口不直接返回单局 LP 变化，因此趋势图展示的是名次动量，而不是真实胜点差值。");
   }
+
+  const signatureComps = pickSignatureComps(compStatsWithMeta).map((comp, index) => ({
+    rank: index + 1,
+    name: comp.name,
+    count: comp.count,
+    avgPlacement: comp.avgPlacement,
+    top4Rate: comp.top4Rate,
+    winRate: comp.winRate,
+    playRate: comp.playRate,
+    matchedMetaName: comp.matchedMeta?.name || null,
+    proficiencyLabel: comp.metaComparison?.label || null,
+    proficiencyTone: comp.metaComparison?.tone || "neutral",
+    standardLabel: comp.metaComparison?.standardLabel || null,
+    summary: comp.metaComparison?.summary
+      || (comp.count >= 3
+        ? "这是你近 30 场里样本相对更足、综合表现更稳定的一套。"
+        : "样本不算多，但当前阶段这套的综合表现最好。"),
+  }));
+
+  const bestCompCount = signatureComps.length;
+  const signatureSummary = bestCompCount
+    ? `近 30 场里最值得优先保留的 ${bestCompCount === 1 ? "主力阵容" : "两套主力阵容"} 已提炼出来，适合优先做针对性复盘。`
+    : "近 30 场样本不足，暂时还不能稳定判断你的主力阵容。";
 
   return {
     matches,
@@ -544,7 +1336,8 @@ function analyzeBundle(bundle, source = "demo") {
     lpLabel,
     lpTrendSeries,
     hasRealLpChanges,
-    compStats,
+    compStats: compStatsWithMeta,
+    recentCompStats,
     topUnits,
     heatmapUnits,
     synergyMatrix,
@@ -552,7 +1345,7 @@ function analyzeBundle(bundle, source = "demo") {
     styleMetrics,
     metaAvailable,
     metaAlignmentScore,
-    metaMatches: metaMatches.slice(0, 3),
+    metaMatches: metaMatches.slice(0, 4),
     metaSourceLabel,
     metaCardSub,
     metaExplanation: hasLiveMetaBenchmark
@@ -560,6 +1353,8 @@ function analyzeBundle(bundle, source = "demo") {
       : source === "demo"
       ? "当前仅使用本地演示样例做版本对照，不代表真实全服环境。"
       : "当前未接入真实版本环境数据，因此本页建议只基于你自己的近 30 场，不做全服热门阵容对比。",
+    signatureComps,
+    signatureSummary,
     recommendations: recommendations.slice(0, 5),
   };
 }
@@ -669,12 +1464,12 @@ function buildCompBubbleChart(compStats) {
     return '<div class="empty-state">暂无足够阵容数据</div>';
   }
 
-  const width = 920;
+  const width = 1280;
   const height = 330;
-  const padding = { top: 22, right: 20, bottom: 42, left: 54 };
-  const minPlacement = Math.max(1.8, Math.min(...compStats.map((comp) => comp.avgPlacement)) - 0.35);
-  const maxPlacement = Math.min(6.8, Math.max(...compStats.map((comp) => comp.avgPlacement)) + 0.45);
-  const placementSpan = Math.max(maxPlacement - minPlacement, 1.2);
+  const padding = { top: 22, right: 28, bottom: 42, left: 54 };
+  const minPlacement = 1;
+  const maxPlacement = 8;
+  const placementSpan = maxPlacement - minPlacement;
   const maxCount = Math.max(...compStats.map((comp) => comp.count), 1);
   const avgPlacementLine = average(compStats.map((comp) => comp.avgPlacement));
   const avgTop4Line = average(compStats.map((comp) => comp.top4Rate)) * 100;
@@ -682,6 +1477,7 @@ function buildCompBubbleChart(compStats) {
   const xFor = (value) => padding.left + ((maxPlacement - value) / placementSpan) * (width - padding.left - padding.right);
   const yFor = (value) => padding.top + ((100 - value) / 100) * (height - padding.top - padding.bottom);
   const rFor = (count) => 10 + (count / maxCount) * 20;
+  const clampPoint = (value, min, max) => Math.min(Math.max(value, min), max);
 
   const gridY = [0, 25, 50, 75, 100].map((tick) => {
     const y = yFor(tick);
@@ -691,7 +1487,7 @@ function buildCompBubbleChart(compStats) {
     `;
   }).join('');
 
-  const gridXValues = Array.from({ length: 6 }, (_, index) => Number((maxPlacement - (placementSpan / 5) * index).toFixed(1)));
+  const gridXValues = Array.from({ length: 8 }, (_, index) => maxPlacement - index);
   const gridX = gridXValues.map((tick) => {
     const x = xFor(tick);
     return `
@@ -705,34 +1501,74 @@ function buildCompBubbleChart(compStats) {
     <line class="scatter-guide" x1="${padding.left}" y1="${yFor(avgTop4Line)}" x2="${width - padding.right}" y2="${yFor(avgTop4Line)}"></line>
   `;
 
-  const labels = compStats.slice(0, 6).map((comp) => `
-    <text class="scatter-point-label" x="${xFor(comp.avgPlacement)}" y="${yFor(comp.top4Rate * 100) - rFor(comp.count) - 8}" text-anchor="middle">${escapeHtml(comp.name)}</text>
-  `).join('');
+  const pointLayouts = compStats.map((comp) => ({
+    comp,
+    baseX: xFor(comp.avgPlacement),
+    baseY: yFor(comp.top4Rate * 100),
+    radius: rFor(comp.count),
+  }));
 
-  const points = compStats.map((comp) => `
+  const overlapGroups = new Map();
+  pointLayouts.forEach((point, index) => {
+    const key = `${point.baseX.toFixed(2)}:${point.baseY.toFixed(2)}:${point.radius.toFixed(2)}`;
+    if (!overlapGroups.has(key)) {
+      overlapGroups.set(key, []);
+    }
+    overlapGroups.get(key).push(index);
+  });
+
+  overlapGroups.forEach((indexes) => {
+    if (indexes.length <= 1) {
+      return;
+    }
+
+    const base = pointLayouts[indexes[0]];
+    const spread = Math.min(base.radius * 1.15, 38);
+    const minX = padding.left + base.radius;
+    const maxX = width - padding.right - base.radius;
+    const plannedX = indexes.map((_, order) => base.baseX + (order - (indexes.length - 1) / 2) * spread);
+    const shiftX = plannedX[0] < minX
+      ? minX - plannedX[0]
+      : plannedX[plannedX.length - 1] > maxX
+      ? maxX - plannedX[plannedX.length - 1]
+      : 0;
+
+    indexes.forEach((pointIndex, order) => {
+      const point = pointLayouts[pointIndex];
+      const offsetY = indexes.length > 2 ? Math.abs(order - (indexes.length - 1) / 2) * 8 : 0;
+      point.baseX = plannedX[order] + shiftX;
+      point.baseY = clampPoint(base.baseY + offsetY, padding.top + point.radius, height - padding.bottom - point.radius);
+    });
+  });
+
+  const points = pointLayouts.map((point) => `
     <g>
-      <circle cx="${xFor(comp.avgPlacement)}" cy="${yFor(comp.top4Rate * 100)}" r="${rFor(comp.count)}" fill="${comp.tierColor}" fill-opacity="0.78" stroke="rgba(255,255,255,0.22)" stroke-width="1.5">
-        <title>${comp.name} · ${comp.count} 场 · 均名 ${comp.avgPlacement.toFixed(2)} · 前四率 ${formatPercent(comp.top4Rate)} · 吃鸡率 ${formatPercent(comp.winRate)}</title>
+      <circle cx="${point.baseX}" cy="${point.baseY}" r="${point.radius}" fill="${point.comp.tierColor}" fill-opacity="0.78" stroke="rgba(255,255,255,0.22)" stroke-width="1.5">
+        <title>${point.comp.name} · ${point.comp.count} 场 · 均名 ${point.comp.avgPlacement.toFixed(2)} · 前四率 ${formatPercent(point.comp.top4Rate)} · 吃鸡率 ${formatPercent(point.comp.winRate)}</title>
       </circle>
-      <text class="scatter-point-count" x="${xFor(comp.avgPlacement)}" y="${yFor(comp.top4Rate * 100) + 4}" text-anchor="middle">${comp.count}</text>
+      <text class="scatter-point-count" x="${point.baseX}" y="${point.baseY + 4}" text-anchor="middle">${point.comp.count}</text>
     </g>
   `).join('');
 
   return `
-    <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="comp-bubble-chart">
-      ${gridY}
-      ${gridX}
-      ${guideLines}
-      ${points}
-      ${labels}
-      <text class="scatter-axis-label" x="${width / 2}" y="${height - 2}" text-anchor="middle">平均名次（越往右越好）</text>
-      <text class="scatter-axis-label" x="16" y="${height / 2}" transform="rotate(-90 16 ${height / 2})" text-anchor="middle">前四率 (%)</text>
-    </svg>
+    <div class="bubble-chart-scroll">
+      <div class="bubble-chart-width" style="width:${width}px">
+        <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="comp-bubble-chart">
+          ${gridY}
+          ${gridX}
+          ${guideLines}
+          ${points}
+          <text class="scatter-axis-label" x="${width / 2}" y="${height - 2}" text-anchor="middle">平均名次（越往右越好）</text>
+          <text class="scatter-axis-label" x="16" y="${height / 2}" transform="rotate(-90 16 ${height / 2})" text-anchor="middle">前四率 (%)</text>
+        </svg>
+      </div>
+    </div>
   `;
 }
 
 function renderCompInsights(analysis) {
   const compRows = analysis.compStats.slice(0, 10);
+  const recentBubbleRows = (analysis.recentCompStats || []).slice(0, 10);
   if (!compRows.length) {
     dom.compTable.innerHTML = '<div class="empty-state">暂无足够阵容数据</div>';
     dom.compDonut.innerHTML = '<div class="empty-state">暂无足够阵容数据</div>';
@@ -752,6 +1588,8 @@ function renderCompInsights(analysis) {
           <th>前四率</th>
           <th>吃鸡率</th>
           <th>第八率</th>
+          <th>环境均值</th>
+          <th>熟练度</th>
         </tr>
       </thead>
       <tbody>
@@ -768,6 +1606,20 @@ function renderCompInsights(analysis) {
             <td class="numeric">${formatPercent(comp.top4Rate)}</td>
             <td class="numeric warn">${formatPercent(comp.winRate)}</td>
             <td class="numeric muted-cell">${formatPercent(comp.eighthRate)}</td>
+            <td>
+              ${comp.matchedMeta
+                ? (comp.metaComparison
+                  ? `<div class="comparison-primary">${escapeHtml(comp.metaComparison.standardLabel)} · 均名 ${comp.matchedMeta.avgPlacement.toFixed(2)} / 前四 ${comp.matchedMeta.top4Rate}% / 登顶 ${comp.matchedMeta.firstPlaceRate}%</div>
+                   <div class="comp-table-sub">${escapeHtml(comp.matchedMeta.name)}</div>`
+                  : `<div class="comp-table-sub">已命中 ${escapeHtml(comp.matchedMeta.name)}，但当前环境样例未提供完整均值指标</div>`)
+                : '<div class="comp-table-sub">未命中稳定环境骨架</div>'}
+            </td>
+            <td>
+              ${comp.metaComparison
+                ? `<span class="proficiency-chip proficiency-${comp.metaComparison.tone}">${escapeHtml(comp.metaComparison.label)}</span>
+                   <div class="comp-table-sub">${escapeHtml(comp.metaComparison.standardShortLabel)} · 均名 ${formatSignedNumber(comp.metaComparison.avgPlacementGap, 2)} · 前四 ${formatSignedPercentPoint(comp.metaComparison.top4Gap)} · 登顶 ${formatSignedPercentPoint(comp.metaComparison.firstGap)}</div>`
+                : '<span class="proficiency-chip proficiency-muted">未匹配</span>'}
+            </td>
           </tr>
         `).join('')}
       </tbody>
@@ -775,15 +1627,22 @@ function renderCompInsights(analysis) {
   `;
 
   dom.compDonut.innerHTML = buildCompDonut(compRows, analysis.matches.length);
-  dom.compBubble.innerHTML = buildCompBubbleChart(compRows);
+  dom.compBubble.innerHTML = buildCompBubbleChart(recentBubbleRows);
 }
 function renderProfile(bundle, analysis, source) {
   const rank = bundle.player.rank;
   const totalGames = (rank?.wins || 0) + (rank?.losses || 0);
   const rankWinRate = totalGames ? formatPercent((rank.wins || 0) / totalGames) : "--";
+  const avatarFallback = escapeHtml((bundle.player.gameName || "?").slice(0, 1).toUpperCase());
+  const profileIconUrl = getProfileIconUrl(bundle.player.profileIconId);
   dom.profileCard.innerHTML = `
     <div class="profile-header">
-      <div class="avatar-orb">${escapeHtml((bundle.player.gameName || "?").slice(0, 1).toUpperCase())}</div>
+      <div class="avatar-orb ${profileIconUrl ? "has-image" : ""}">
+        ${profileIconUrl
+          ? `<img class="avatar-image" src="${profileIconUrl}" alt="${escapeHtml(bundle.player.gameName || "玩家")}头像" loading="eager" referrerpolicy="no-referrer" onerror="this.parentElement.classList.remove('has-image'); this.remove();">`
+          : ""}
+        <span class="avatar-fallback-text">${avatarFallback}</span>
+      </div>
       <div>
         <h2 class="profile-name">${escapeHtml(bundle.player.gameName || "Unknown")}<span class="profile-tag">#${escapeHtml(bundle.player.tagLine || "----")}</span></h2>
         <p class="subhead">${escapeHtml(bundle.player.region?.label || "未知服务器")}</p>
@@ -855,6 +1714,81 @@ function renderSummary(analysis) {
       <div class="metric-sub">${escapeHtml(card.sub)}</div>
     </article>
   `).join("");
+}
+
+function renderThirtyGameSummary(analysis) {
+  const overviewCards = [
+    {
+      label: "样本量",
+      value: `${analysis.matches.length} 场`,
+      sub: "最近 30 场窗口",
+    },
+    {
+      label: "常用骨架",
+      value: `${analysis.compStats.length} 套`,
+      sub: "出现过的阵容骨架",
+    },
+    {
+      label: "主力占比",
+      value: `${Math.round(((analysis.signatureComps[0]?.count || 0) / Math.max(analysis.matches.length, 1)) * 100)}%`,
+      sub: analysis.signatureComps[0]?.name || "暂无",
+    },
+    {
+      label: "总结",
+      value: analysis.metaAvailable ? "含环境对照" : "仅个人数据",
+      sub: analysis.signatureSummary,
+    },
+  ];
+
+  const signatureCards = analysis.signatureComps.map((comp) => `
+    <article class="signature-card">
+      <div class="signature-card-head">
+        <div>
+          <div class="summary-label">擅长阵容 ${comp.rank}</div>
+          <h3>${escapeHtml(comp.name)}</h3>
+        </div>
+        <span class="proficiency-chip proficiency-${escapeHtml(comp.proficiencyTone)}">${escapeHtml(comp.proficiencyLabel || "综合最佳")}</span>
+      </div>
+      <div class="signature-stats">
+        <div class="signature-stat">
+          <span>样本</span>
+          <strong>${comp.count} 场</strong>
+        </div>
+        <div class="signature-stat">
+          <span>均名</span>
+          <strong>${comp.avgPlacement.toFixed(2)}</strong>
+        </div>
+        <div class="signature-stat">
+          <span>前四</span>
+          <strong>${formatPercent(comp.top4Rate)}</strong>
+        </div>
+        <div class="signature-stat">
+          <span>登顶</span>
+          <strong>${formatPercent(comp.winRate)}</strong>
+        </div>
+      </div>
+      <p class="style-copy">${escapeHtml(comp.summary)}</p>
+      <div class="signature-meta">
+        <span>${escapeHtml(comp.standardLabel || "个人综合标准")}</span>
+        <span>${escapeHtml(comp.matchedMetaName || "未命中环境阵容")}</span>
+      </div>
+    </article>
+  `).join("");
+
+  dom.thirtyGameSummary.innerHTML = `
+    <div class="snapshot-overview">
+      ${overviewCards.map((item) => `
+        <article class="snapshot-mini-card">
+          <div class="summary-label">${escapeHtml(item.label)}</div>
+          <div class="snapshot-value">${escapeHtml(item.value)}</div>
+          <div class="metric-sub">${escapeHtml(item.sub)}</div>
+        </article>
+      `).join("")}
+    </div>
+    <div class="signature-list">
+      ${signatureCards || '<div class="empty-state">暂无足够数据判断最擅长阵容</div>'}
+    </div>
+  `;
 }
 
 function renderCharts(analysis) {
@@ -937,13 +1871,13 @@ function renderComps(analysis) {
 
   const head = `
     <div class="heatmap-row">
-      <div class="heatmap-head"></div>
-      ${analysis.heatmapUnits.map((unit) => `<div class="heatmap-head">${escapeHtml(unit)}</div>`).join("")}
+      <div class="heatmap-corner"></div>
+      ${analysis.heatmapUnits.map((unit) => `<div class="heatmap-head heatmap-col-head" title="${escapeHtml(unit)}">${escapeHtml(unit)}</div>`).join("")}
     </div>
   `;
   const rows = analysis.heatmapUnits.map((rowUnit, rowIndex) => `
     <div class="heatmap-row">
-      <div class="heatmap-head">${escapeHtml(rowUnit)}</div>
+      <div class="heatmap-head heatmap-row-head" title="${escapeHtml(rowUnit)}">${escapeHtml(rowUnit)}</div>
       ${analysis.synergyMatrix[rowIndex].map((value) => {
         const bg = `rgba(${255 - value}, ${90 + Math.round(value * 0.8)}, ${255 - Math.round(value * 0.5)}, ${0.16 + value / 180})`;
         return `<div class="heatmap-cell" style="background:${bg}">${value}%</div>`;
@@ -951,7 +1885,7 @@ function renderComps(analysis) {
     </div>
   `).join("");
 
-  dom.synergyHeatmap.innerHTML = `<div class="heatmap-grid">${head}${rows}</div>`;
+  dom.synergyHeatmap.innerHTML = `<div class="heatmap-scroll"><div class="heatmap-grid">${head}${rows}</div></div>`;
 }
 
 function renderStyle(bundle, analysis) {
@@ -980,10 +1914,13 @@ function renderStyle(bundle, analysis) {
             <div class="meta-copy">
               <h4>${escapeHtml(entry.comp)}</h4>
               <p>${escapeHtml(entry.matched
-                ? `匹配 ${entry.matched.name} · 相似度 ${entry.matchScore}/100${entry.matched.pickRate != null ? ` · Pick ${entry.matched.pickRate}%` : ""}${entry.matched.winRate != null ? ` · Win ${entry.matched.winRate}%` : ""}`
+                ? (entry.comparison
+                  ? `匹配 ${entry.matched.name} · ${entry.comparison.standardLabel} · ${entry.comparison.label} · 玩家均名 ${analysis.compStats.find((comp) => comp.name === entry.comp)?.avgPlacement.toFixed(2)} vs 环境 ${entry.matched.avgPlacement.toFixed(2)} · 玩家前四 ${entry.comparison.playerTop4Rate}% vs 环境 ${entry.matched.top4Rate}%`
+                  : `匹配 ${entry.matched.name} · 当前环境样例未提供完整均值指标，因此暂不做熟练度判断`)
                 : `未命中稳定热门骨架 · 当前相似度 ${entry.matchScore}/100`)} </p>
+              ${entry.comparison ? `<p>${escapeHtml(entry.comparison.summary)}</p>` : ""}
             </div>
-            <span class="meta-badge">${entry.count} 场</span>
+            <span class="meta-badge">${entry.count} 场${entry.comparison?.proficiencyScore != null ? ` · ${entry.comparison.proficiencyScore}` : ""}</span>
           </li>
         `).join("")}
       </ul>
@@ -1018,9 +1955,6 @@ function renderMatches(analysis) {
   dom.matchList.innerHTML = renderedMatches.map((match) => {
     const placementClass = match.placement <= 2 ? "good" : match.placement <= 4 ? "" : "bad";
     const compName = inferBoardSummary(match);
-    const units = (match.units || []).slice(0, 6).map((unit) => unit.name).join("、");
-    const traits = summarizeTraits(match).join("、");
-    const augments = (match.augments || []).slice(0, 3).join("、") || "暂无海克斯信息";
     const insight = match.placement <= 2
       ? "这局成功把前期优势转成了高上限终盘。"
       : match.placement <= 4
@@ -1040,36 +1974,14 @@ function renderMatches(analysis) {
           <div class="match-stats">
             <div class="metric-sub">${typeof match.lpChange === "number" ? `${match.lpChange > 0 ? "+" : ""}${match.lpChange} LP` : "Riot 官方无单局 LP"}</div>
             <div class="match-actions">
-              <button class="match-replay-button" type="button">查看录像</button>
+              <button class="match-replay-button" type="button">完整面板</button>
               <button class="match-detail-toggle" type="button">展开详情</button>
             </div>
           </div>
         </div>
         <p class="match-note">${escapeHtml(insight)}</p>
         <div class="match-detail">
-          <div class="match-detail-grid">
-            <div class="detail-box">
-              <h4>对局摘要</h4>
-              <ul>
-                <li>${escapeHtml(units || "暂无单位数据")}</li>
-                <li>${escapeHtml(traits || "暂无羁绊数据")}</li>
-              </ul>
-            </div>
-            <div class="detail-box">
-              <h4>关键增强</h4>
-              <ul>
-                <li>${escapeHtml(augments)}</li>
-                <li>${match.goldLeft == null ? "经济曲线：暂不可得" : `结束剩余金币 ${match.goldLeft}`}</li>
-              </ul>
-            </div>
-            <div class="detail-box">
-              <h4>复盘结论</h4>
-              <ul>
-                <li>${escapeHtml(match.placement <= 4 ? "命中自己的舒适节奏，稳血表现合格。" : "需要更早判断是否继续冲本命阵容。")}</li>
-                <li>${escapeHtml(match.level >= 8 ? "终盘等级达标，说明经济线还可以。" : "终盘等级偏低，后期上限受到影响。")}</li>
-              </ul>
-            </div>
-          </div>
+          ${renderExpandedMatchDetail(match)}
         </div>
       </article>
     `;
@@ -1099,6 +2011,7 @@ function render(bundle, source) {
   const analysis = analyzeBundle(bundle, source);
   renderProfile(bundle, analysis, source);
   renderSummary(analysis);
+  renderThirtyGameSummary(analysis);
   renderCharts(analysis);
   renderComps(analysis);
   renderCompInsights(analysis);
